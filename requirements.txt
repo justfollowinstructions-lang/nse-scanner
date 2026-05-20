@@ -1,21 +1,25 @@
-# NSE Long-Term Investment Scanner — Python dependencies
+# NSE Long-Term Investment Scanner v2 — Python dependencies
 # Install: pip install -r requirements.txt
 
 # ── Core data ──────────────────────────────────────────────────────────────────
-yfinance>=0.2.50          # Yahoo Finance OHLCV + fundamentals
+yfinance>=0.2.50          # Yahoo Finance OHLCV + fundamentals + dividend history
 pandas>=2.1.0             # DataFrame operations
 numpy>=1.26.0             # Numerical arrays / math
 scipy>=1.11.0             # find_peaks, percentileofscore
 
 # ── Web scraping (Screener.in fundamentals) ────────────────────────────────────
-requests>=2.31.0          # HTTP requests for screener.in + NSE universe
+requests>=2.31.0          # HTTP for screener.in + NSE universe CSV
 beautifulsoup4>=4.12.2    # HTML parser for screener.in
-lxml>=5.1.0               # Fast HTML/XML parser backend for BeautifulSoup
 
-# ── Yahoo Finance 401 workaround on CI ────────────────────────────────────────
-# Chrome impersonation prevents Yahoo from blocking GitHub Actions IPs
-curl_cffi>=0.6.2          # curl with TLS fingerprinting (Chrome impersonation)
+# MIN-07 FIX: pin lxml upper bound — lxml 5.3+ changed HTMLParser API
+# and broke BeautifulSoup parsing of screener.in tables silently.
+lxml>=4.9.0,<5.3.0
 
-# ── Optional but recommended ──────────────────────────────────────────────────
-python-dateutil>=2.8.2    # Robust date parsing
+# ── Yahoo Finance 401 workaround on GitHub Actions CI ─────────────────────────
+# curl_cffi provides Chrome TLS fingerprint impersonation.
+# Without it, Yahoo Finance returns 401 on GitHub Actions IP ranges.
+curl_cffi>=0.6.2
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dateutil>=2.8.2    # Robust date parsing (used by yfinance internally)
 pytz>=2024.1              # Timezone support
