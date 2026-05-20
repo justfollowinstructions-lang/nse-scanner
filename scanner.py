@@ -48,6 +48,7 @@ import os, sys, json, time, sqlite3, argparse, logging, threading
 from datetime import date, datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
+import numpy as np
 
 # MIN-02 FIX
 warnings.filterwarnings("ignore", category=FutureWarning,      module="yfinance")
@@ -265,6 +266,22 @@ def _to_cr(val) -> float | None:
         return round(float(val) / 1e7, 2)
     except Exception:
         return None
+
+
+def _to_native(obj):
+    """Convert numpy/pandas types to native Python for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: _to_native(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return type(obj)(_to_native(v) for v in obj)
+    elif isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        return obj
 
 
 def _ema(prices: np.ndarray, n: int) -> float:
@@ -1792,11 +1809,12 @@ def save_results(results: list[dict], scan_id: str, max_per_sector: int = 0):
     con = _get_db()
     with _db_lock:
         for r in results:
+            r_native = _to_native(r)  # Convert numpy types to native Python
             con.execute(
                 "INSERT OR REPLACE INTO scan_results "
                 "(scan_id,scan_date,stock,score,grade,result_json) VALUES (?,?,?,?,?,?)",
                 (scan_id, str(_today()), r["Stock"],
-                 r["Overall_Score_100"], r["Rating_Grade"], json.dumps(r)))
+                 r["Overall_Score_100"], r["Rating_Grade"], json.dumps(r_native)))
         con.commit()
 
     ts  = _now().strftime("%Y%m%d_%H%M")
