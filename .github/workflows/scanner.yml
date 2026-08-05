@@ -1,242 +1,251 @@
-name: NSE Long-Term Investment Scanner
-
-# ─────────────────────────────────────────────────────────────────────
-# SCHEDULE OVERVIEW  (all times IST)
-#
-#  ┌─ Bi-weekly full scan  ─ 1st & 15th of every month at 8:00 AM
-#  ├─ Weekly fundamentals  ─ Every Sunday at 7:00 AM (keeps data fresh)
-#  └─ Watchlist check      ─ Every Saturday at 9:00 AM
-#
-# Convert IST → UTC:  subtract 5h 30m
-#   8:00 AM IST  = 2:30 AM UTC
-#   7:00 AM IST  = 1:30 AM UTC
-#   9:00 AM IST  = 3:30 AM UTC
-# ─────────────────────────────────────────────────────────────────────
+name: NSE Live Scanner v5.0
 
 on:
   schedule:
-    # ── Bi-weekly full scan (1st and 15th of each month at 8 AM IST) ──────────
-    - cron: "30 2 1  * *"   # 1st of month,  8:00 AM IST
-    - cron: "30 2 15 * *"   # 15th of month, 8:00 AM IST
+    - cron: "30 2 * * 1-5"
 
-    # ── Weekly fundamentals refresh (every Sunday 7 AM IST) ──────────────────
-    - cron: "30 1 * * 0"
-
-    # ── Weekly watchlist check (every Saturday 9 AM IST) ─────────────────────
-    - cron: "30 3 * * 6"
-
-  # ── Manual trigger ───────────────────────────────────────────────────────────
   workflow_dispatch:
     inputs:
       mode:
-        description: "Mode to run"
+        description: "Run mode"
         required: true
         type: choice
-        options:
-          - full-scan          # Full scan of entire NSE universe
-          - watchlist          # Quick rescan of previously found stocks
-          - update-ohlcv       # Update price data only (no scan)
-          - update-fundamentals # Update fundamentals only
-          - update-sectors     # Update index/sector data
-          - bootstrap          # First-time full download (~90 min)
-          - test               # Test run on 50 large-caps
-          - stats              # Print cache statistics
-      min_score:
-        description: "Minimum score to include in results (0-100)"
-        required: false
-        default: "35"
+        options: [daily, test, healthcheck, bootstrap]
 
 permissions:
   contents: write
 
+# ════════════════════════════════════════════════════════════════════
+# DAILY — EOD update all 2139 stocks, full pattern scan, commit watchlist
+# ════════════════════════════════════════════════════════════════════
 jobs:
-  invest_scan:
+
+  daily:
+    if: |
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'daily')
+
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 200
 
     steps:
-      # ── Checkout ────────────────────────────────────────────────────────────
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Python setup ─────────────────────────────────────────────────────────
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ── pip cache ────────────────────────────────────────────────────────────
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          restore-keys: ${{ runner.os }}-pip-
 
-      # ── Install dependencies ──────────────────────────────────────────────────
       - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+        run: pip install -q -r requirements.txt
 
-      # ── Cache: invest_cache.db (persisted across runs by week) ────────────────
-      # We use a weekly key so the db is effectively permanent for 7 days.
-      # On week rollover the cache is rebuilt incrementally in minutes
-      # (only new bars are downloaded, fundamentals reuse the stale cache).
+      # week step MUST precede cache restore
       - name: Get week number
         id: week
-        run: echo "week=$(date -u +%Y-W%V)" >> $GITHUB_OUTPUT
+        run: echo "week=$(date -u +%V)" >> $GITHUB_OUTPUT
 
-      - name: Restore invest_cache.db
+      - name: Restore price cache
         uses: actions/cache@v4
         with:
-          path: invest_cache.db
-          key: invest-cache-${{ runner.os }}-${{ steps.week.outputs.week }}
+          path: price_cache.db
+          key: price-cache-${{ runner.os }}-w${{ steps.week.outputs.week }}
           restore-keys: |
-            invest-cache-${{ runner.os }}-
+            price-cache-${{ runner.os }}-
 
-      # ── Determine mode from schedule or manual input ─────────────────────────
-      - name: Determine mode
-        id: mode
-        run: |
-          SCHED="${{ github.event.schedule }}"
-          INPUT="${{ github.event.inputs.mode }}"
+      - name: Restore signals DB
+        uses: actions/cache@v4
+        with:
+          path: signals.db
+          key: signals-db-${{ runner.os }}-w${{ steps.week.outputs.week }}
+          restore-keys: |
+            signals-db-${{ runner.os }}-
 
-          if [ -n "$INPUT" ]; then
-            echo "MODE=$INPUT" >> $GITHUB_OUTPUT
+      - name: EOD update (all stocks)
+        run: python data_updater.py --daily
 
-          # Sunday = fundamentals refresh
-          elif [ "$SCHED" = "30 1 * * 0" ]; then
-            echo "MODE=update-fundamentals" >> $GITHUB_OUTPUT
+      - name: Sector update
+        run: python data_updater.py --sectors || true
 
-          # Saturday = watchlist check
-          elif [ "$SCHED" = "30 3 * * 6" ]; then
-            echo "MODE=watchlist" >> $GITHUB_OUTPUT
-
-          # 1st or 15th = full scan
-          else
-            echo "MODE=full-scan" >> $GITHUB_OUTPUT
-          fi
-
-      # ── Minimum score (default 35, configurable via manual trigger) ──────────
-      - name: Set min score
-        id: minscore
-        run: |
-          INPUT="${{ github.event.inputs.min_score }}"
-          echo "MIN_SCORE=${INPUT:-35}" >> $GITHUB_OUTPUT
-
-      # ─────────────────────────────────────────────────────────────────────────
-      # BOOTSTRAP  (run once to build the full database)
-      # ─────────────────────────────────────────────────────────────────────────
-      - name: Bootstrap (first-time full download)
-        if: steps.mode.outputs.MODE == 'bootstrap'
-        timeout-minutes: 110
-        run: |
-          echo "=== Bootstrap: downloading all NSE stocks ==="
-          python data_updater.py --bootstrap
-          python data_updater.py --stats
-
-      # ─────────────────────────────────────────────────────────────────────────
-      # FULL SCAN (bi-weekly: 1st and 15th)
-      # Steps:  update OHLCV → update sectors → run full scan
-      # ─────────────────────────────────────────────────────────────────────────
-      - name: Full scan
-        if: steps.mode.outputs.MODE == 'full-scan'
+      - name: Run daily scan
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
-        run: |
-          echo "=== Step 1/3: Update OHLCV (new bars only) ==="
-          python data_updater.py --update
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python scanner.py --daily --telegram
 
-          echo "=== Step 2/3: Update sector indices ==="
-          python data_updater.py --sectors
+      - name: Track signal outcomes
+        run: python scanner.py --outcomes || true
 
-          echo "=== Step 3/3: Run investment scan ==="
-          python scanner.py --scan --min-score ${{ steps.minscore.outputs.MIN_SCORE }}
-
-      # ─────────────────────────────────────────────────────────────────────────
-      # WATCHLIST CHECK (weekly Saturday)
-      # Rescans previously identified stocks only — fast (~5 min)
-      # ─────────────────────────────────────────────────────────────────────────
-      - name: Watchlist rescan
-        if: steps.mode.outputs.MODE == 'watchlist'
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
-        run: |
-          echo "=== Updating OHLCV for watchlist stocks ==="
-          python data_updater.py --update
-          echo "=== Watchlist rescan ==="
-          python scanner.py --watchlist
-
-      # ─────────────────────────────────────────────────────────────────────────
-      # FUNDAMENTALS REFRESH (weekly Sunday)
-      # Force-refreshes all fundamentals from yfinance + screener.in
-      # ─────────────────────────────────────────────────────────────────────────
-      - name: Update fundamentals
-        if: steps.mode.outputs.MODE == 'update-fundamentals'
-        run: |
-          echo "=== Refreshing fundamentals (yfinance + screener.in) ==="
-          python data_updater.py --fundamentals
-
-      # ─────────────────────────────────────────────────────────────────────────
-      # STANDALONE MODES (manual trigger only)
-      # ─────────────────────────────────────────────────────────────────────────
-      - name: Update OHLCV only
-        if: steps.mode.outputs.MODE == 'update-ohlcv'
-        run: python data_updater.py --update
-
-      - name: Update sectors only
-        if: steps.mode.outputs.MODE == 'update-sectors'
-        run: python data_updater.py --sectors
-
-      - name: Stats
-        if: steps.mode.outputs.MODE == 'stats'
-        run: python data_updater.py --stats
-
-      - name: Test run (50 large-caps)
-        if: steps.mode.outputs.MODE == 'test'
-        run: python scanner.py --test
-
-      # ─────────────────────────────────────────────────────────────────────────
-      # SAVE CACHE  (always runs — preserves invest_cache.db for next run)
-      # ─────────────────────────────────────────────────────────────────────────
-      - name: Save invest_cache.db
+      - name: Save price cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: invest_cache.db
-          key: invest-cache-${{ runner.os }}-${{ steps.week.outputs.week }}-${{ github.run_number }}
+          path: price_cache.db
+          key: price-cache-${{ runner.os }}-w${{ steps.week.outputs.week }}-${{ github.run_number }}
 
-      # ─────────────────────────────────────────────────────────────────────────
-      # COMMIT SCAN RESULTS  (only after a real scan, not data-only updates)
-      # ─────────────────────────────────────────────────────────────────────────
-      - name: Commit output CSVs
-        if: |
-          steps.mode.outputs.MODE == 'full-scan' ||
-          steps.mode.outputs.MODE == 'watchlist'  ||
-          steps.mode.outputs.MODE == 'test'
+      - name: Save signals DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: signals.db
+          key: signals-db-${{ runner.os }}-w${{ steps.week.outputs.week }}-${{ github.run_number }}
+
+      - name: Commit watchlist
+        if: always()
         run: |
-          git config user.name  "NSE Investment Scanner Bot"
-          git config user.email "invest-scanner@noreply.github.com"
-          git add output/ || true
+          git config user.name "NSE Scanner Bot"
+          git config user.email "scanner@noreply.github.com"
+          git add watchlist.json || true
           git diff --staged --quiet || \
-            git commit -m "scan: $(date -u '+%Y-%m-%d') — investment results"
+            git commit -m "watchlist: $(date -u '+%Y-%m-%d %H:%M') [daily]"
           git push || true
 
-      # ─────────────────────────────────────────────────────────────────────────
-      # UPLOAD ARTIFACTS  (always — download CSVs from GitHub Actions UI)
-      # ─────────────────────────────────────────────────────────────────────────
-      - name: Upload scan results
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: invest-scan-${{ steps.mode.outputs.MODE }}-${{ github.run_number }}
+          name: daily-${{ github.run_number }}
           path: |
             output/
             logs/
-          retention-days: 60
+            signals.db
+            watchlist.json
+          retention-days: 30
+          if-no-files-found: warn
+
+
+  # ════════════════════════════════════════════════════════════════════
+  # TEST — 100 stocks, sends Telegram so you can verify output
+  # ════════════════════════════════════════════════════════════════════
+
+  test:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -q -r requirements.txt
+
+      - name: Get week number
+        id: week
+        run: echo "week=$(date -u +%V)" >> $GITHUB_OUTPUT
+
+      - name: Restore price cache
+        uses: actions/cache@v4
+        with:
+          path: price_cache.db
+          key: price-cache-${{ runner.os }}-w${{ steps.week.outputs.week }}
+          restore-keys: |
+            price-cache-${{ runner.os }}-
+
+      - name: Run test scan (100 stocks + Telegram)
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python scanner.py --test --telegram
+
+      - name: Save price cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: price_cache.db
+          key: price-cache-${{ runner.os }}-w${{ steps.week.outputs.week }}-${{ github.run_number }}
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ github.run_number }}
+          path: output/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ════════════════════════════════════════════════════════════════════
+  # BOOTSTRAP
+  # ════════════════════════════════════════════════════════════════════
+
+  bootstrap:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'bootstrap'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -q -r requirements.txt
+
+      - name: Get week number
+        id: week
+        run: echo "week=$(date -u +%V)" >> $GITHUB_OUTPUT
+
+      - name: Bootstrap all stock history
+        run: python data_updater.py --bootstrap
+
+      - name: Save price cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: price_cache.db
+          key: price-cache-${{ runner.os }}-w${{ steps.week.outputs.week }}-bootstrap-${{ github.run_number }}
+
+      - name: Upload cache DB
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-cache-${{ github.run_number }}
+          path: price_cache.db
+          retention-days: 7
+
+  # ════════════════════════════════════════════════════════════════════
+  # HEALTHCHECK
+  # ════════════════════════════════════════════════════════════════════
+
+  healthcheck:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'healthcheck'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -q -r requirements.txt
+
+      - name: Healthcheck
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python scanner.py --healthcheck
