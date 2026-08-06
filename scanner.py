@@ -3844,8 +3844,16 @@ def main():
     # key facts in one place that's easy to grep/scroll to.
     log.info("=" * 60)
     log.info("RUN ARTIFACTS")
-    log.info(f"  HTML dashboard : {dashboard_path or 'NOT CREATED — see dashboard_export WARNING above '
-              '(usually a missing chart_viewer/template.html or vendor/lightweight-charts...js file)'}")
+    dashboard_msg = (
+      dashboard_path
+      or (
+        "NOT CREATED — see dashboard_export WARNING above "
+        "(usually a missing chart_viewer/template.html or "
+        "vendor/lightweight-charts...js file)"
+      )
+    )
+
+    log.info(f"  HTML dashboard : {dashboard_msg}")
     log.info(f"  Watchlist      : {WL_PATH}")
     log.info(f"  High-conviction: {os.path.join(BASE_DIR, 'high_conviction_watchlist.json')}")
     log.info("=" * 60)
